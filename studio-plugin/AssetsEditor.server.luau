@@ -1,37 +1,39 @@
--- Assets Editor Studio plugin.
+-- Assets Editor — minimal Studio plugin for tagging Instances with
+-- AssetKey: / AssetLabel: in a single panel. Mirrors the chrome
+-- conventions of the Components editor so the two feel like one
+-- toolset.
 --
--- Companion to the Assets runtime (plugins/Assets/runtime/AssetsService.luau).
--- Edits the two CollectionService tag prefixes the runtime uses:
+-- Selected Instance → one auto-key button (uses the Instance's Name,
+-- conflicts shown inline) + a label dropdown listing every existing
+-- AssetLabel:* in the place plus a "Create new…" entry that opens a
+-- tiny text-input row. Existing tags are shown as removable chips.
 --
---   AssetKey:<name>   — exactly one Instance per name; identifies an asset.
---   AssetLabel:<name> — many Instances per name; groups assets.
---
--- Same install pattern as ComponentEditor: Rojo mounts this file at
--- ServerStorage.Editors.AssetsEditor; right-click → Save as Local Plugin.
--- See ../README.md for full instructions.
+-- Install: drop this file under ServerStorage or any non-replicated
+-- container in Studio, right-click → Save as Local Plugin.
 
 local plugin = plugin
 
 local Selection = game:GetService("Selection")
 local CollectionService = game:GetService("CollectionService")
-local UserInputService = game:GetService("UserInputService")
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local StudioService = game:GetService("StudioService")
 
 local KEY_PREFIX = "AssetKey:"
 local LABEL_PREFIX = "AssetLabel:"
 
 ----------------------------------------------------------------------
--- Module-level state and forward declarations
---
--- Lua locals don't hoist; deeper closures that reference `refresh`
--- need it declared up here so they resolve to the assignment near the
--- bottom rather than a global lookup that silently fails.
+-- Module-level state
 ----------------------------------------------------------------------
 
 local refresh
+local widget
 
 ----------------------------------------------------------------------
--- Theme — same helper shape as ComponentEditor so colors track Dark /
--- Light Studio theme switches automatically.
+-- Theme
+--
+-- Same palette as the Components editor so the two plugins read as
+-- one toolset. Dark-fixed values rather than Studio-theme-aware,
+-- matching the established convention.
 ----------------------------------------------------------------------
 
 local studio = settings().Studio
@@ -43,15 +45,23 @@ local function color(name, modifier)
 	)
 end
 
+local FIELD_COLOR      = Color3.fromHex("#191A1F")
+local HEADER_COLOR     = Color3.fromHex("#202227")
+local SEPARATOR_COLOR  = Color3.fromHex("#202227")
+local FIELD_HOVER      = HEADER_COLOR
+local ADD_BUTTON_COLOR = Color3.fromHex("#335FFF")
+local CHIP_REMOVE_HOVER = Color3.fromHex("#3D2A2A")
+
+local function pageColor() return color("MainBackground") end
+
 ----------------------------------------------------------------------
--- UI factory helpers — small wrappers so build code reads like a
--- hierarchy of intent. Same shape as ComponentEditor's helpers.
+-- UI helpers
 ----------------------------------------------------------------------
 
 local function makeFrame(props)
 	local frame = Instance.new("Frame")
 	frame.BorderSizePixel = 0
-	frame.BackgroundColor3 = props.color or color("MainBackground")
+	frame.BackgroundColor3 = props.color or FIELD_COLOR
 	frame.BackgroundTransparency = props.transparency or 0
 	frame.Size = props.size or UDim2.new(1, 0, 0, 22)
 	frame.Position = props.position or UDim2.new()
@@ -70,633 +80,429 @@ local function makeLabel(props)
 	label.TextSize = props.size or 14
 	label.Size = props.frameSize or UDim2.new(1, 0, 1, 0)
 	label.Position = props.position or UDim2.new()
-	label.TextTruncate = props.truncate or Enum.TextTruncate.None
 	label.Parent = props.parent
 	return label
 end
 
-local function makePadding(parent, left, right, top, bottom)
-	local pad = Instance.new("UIPadding")
-	pad.PaddingLeft = UDim.new(0, left or 0)
-	pad.PaddingRight = UDim.new(0, right or 0)
-	pad.PaddingTop = UDim.new(0, top or 0)
-	pad.PaddingBottom = UDim.new(0, bottom or 0)
-	pad.Parent = parent
-	return pad
+local function roundCorners(parent, radius)
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, radius or 4)
+	corner.Parent = parent
+	return corner
 end
 
-local function makeStroke(parent, c)
-	local stroke = Instance.new("UIStroke")
-	stroke.Color = c or color("Border")
-	stroke.Thickness = 1
-	stroke.Parent = parent
-	return stroke
-end
-
-local function makeSectionHeader(parent, text)
-	local header = makeFrame({
-		parent = parent,
-		color = color("CategoryItem"),
-		size = UDim2.new(1, 0, 0, 22),
-	})
-	makeStroke(header, color("Border"))
-	makeLabel({
-		parent = header,
-		text = text,
-		color = color("BrightText"),
-		font = Enum.Font.SourceSansBold,
-		frameSize = UDim2.new(1, -16, 1, 0),
-		position = UDim2.new(0, 8, 0, 0),
-	})
-	return header
+local function recordChange(name, fn)
+	local id = ChangeHistoryService:TryBeginRecording(name)
+	if not id then fn(); return end
+	local ok, err = pcall(fn)
+	if ok then
+		ChangeHistoryService:FinishRecording(id, Enum.FinishRecordingOperation.Commit)
+	else
+		ChangeHistoryService:FinishRecording(id, Enum.FinishRecordingOperation.Cancel)
+		warn("[Assets] " .. name .. " errored: " .. tostring(err))
+	end
 end
 
 ----------------------------------------------------------------------
--- Tag inspection helpers
+-- Tag discovery
 ----------------------------------------------------------------------
 
--- Returns the current AssetKey value on this Instance (the bare name,
--- without the prefix) or nil if none. Multiple AssetKey tags on a
--- single Instance shouldn't happen — the editor strips the old one
--- when setting a new one — but if it does we return the first.
-local function currentAssetKey(instance)
-	for _, tag in ipairs(CollectionService:GetTags(instance)) do
-		if tag:sub(1, #KEY_PREFIX) == KEY_PREFIX then
-			return tag:sub(#KEY_PREFIX + 1), tag
+-- Pulls every AssetKey: tag in the place. Used to detect duplicates
+-- before assigning a new one.
+local function allKeysInPlace()
+	local keys = {}
+	for _, tag in ipairs(CollectionService:GetAllTags()) do
+		if string.sub(tag, 1, #KEY_PREFIX) == KEY_PREFIX then
+			keys[string.sub(tag, #KEY_PREFIX + 1)] = true
 		end
 	end
-	return nil, nil
+	return keys
 end
 
-local function currentLabels(instance)
+-- Pulls every AssetLabel: tag in the place. The label dropdown lists
+-- these so the user can reuse instead of re-typing.
+local function allLabelsInPlace()
 	local labels = {}
-	for _, tag in ipairs(CollectionService:GetTags(instance)) do
-		if tag:sub(1, #LABEL_PREFIX) == LABEL_PREFIX then
-			table.insert(labels, tag:sub(#LABEL_PREFIX + 1))
+	for _, tag in ipairs(CollectionService:GetAllTags()) do
+		if string.sub(tag, 1, #LABEL_PREFIX) == LABEL_PREFIX then
+			table.insert(labels, string.sub(tag, #LABEL_PREFIX + 1))
 		end
 	end
 	table.sort(labels)
 	return labels
 end
 
--- All AssetLabel:* tags known to the place. Used by the Add Label
--- picker and the Project Labels panel. Filters from GetAllTags so we
--- don't pollute the result with Component: or other tag namespaces.
-local function allKnownLabels()
-	local out = {}
-	for _, tag in ipairs(CollectionService:GetAllTags()) do
-		if tag:sub(1, #LABEL_PREFIX) == LABEL_PREFIX then
-			table.insert(out, tag:sub(#LABEL_PREFIX + 1))
+-- Returns (currentKey, currentLabels[]) for the given Instance.
+local function tagsOnInstance(instance)
+	local key, labels = nil, {}
+	for _, tag in ipairs(CollectionService:GetTags(instance)) do
+		if string.sub(tag, 1, #KEY_PREFIX) == KEY_PREFIX then
+			key = string.sub(tag, #KEY_PREFIX + 1)
+		elseif string.sub(tag, 1, #LABEL_PREFIX) == LABEL_PREFIX then
+			table.insert(labels, string.sub(tag, #LABEL_PREFIX + 1))
 		end
 	end
-	table.sort(out)
-	return out
-end
-
--- Returns Instances that already hold AssetKey:<key>, excluding the
--- one currently being edited. Used to detect conflicts before
--- applying a new key.
-local function findKeyConflicts(key, exclude)
-	local conflicts = {}
-	for _, inst in ipairs(CollectionService:GetTagged(KEY_PREFIX .. key)) do
-		if inst ~= exclude then
-			table.insert(conflicts, inst)
-		end
-	end
-	return conflicts
+	table.sort(labels)
+	return key, labels
 end
 
 ----------------------------------------------------------------------
--- AssetKey field
---
--- Single TextBox bound to the AssetKey: tag on the selected Instance.
--- On FocusLost: if value is empty, strip any existing AssetKey tag.
--- Otherwise check for a conflict — if a different Instance already
--- holds the key, show an inline error + Jump button and revert. If
--- no conflict, swap the tag in place.
+-- Section rendering
 ----------------------------------------------------------------------
 
-local function buildAssetKeySection(parent, instance)
-	makeSectionHeader(parent, "Asset Key")
-
-	-- Row holding the textbox.
-	local row = makeFrame({
-		parent = parent,
-		color = color("MainBackground"),
-		size = UDim2.new(1, 0, 0, 28),
-	})
-	makePadding(row, 8, 8, 4, 4)
-
-	local well = makeFrame({
-		parent = row,
-		color = color("InputFieldBackground"),
-		size = UDim2.new(1, 0, 1, 0),
-	})
-	makeStroke(well, color("Border"))
-	makePadding(well, 6, 6, 0, 0)
-
-	local box = Instance.new("TextBox")
-	box.BackgroundTransparency = 1
-	box.PlaceholderText = "(no key)"
-	box.PlaceholderColor3 = color("DimmedText")
-	box.Text = currentAssetKey(instance) or ""
-	box.TextColor3 = color("MainText")
-	box.Font = Enum.Font.SourceSans
-	box.TextSize = 14
-	box.TextXAlignment = Enum.TextXAlignment.Left
-	box.Size = UDim2.fromScale(1, 1)
-	box.ClearTextOnFocus = false
-	box.Parent = well
-
-	-- Slot for the conflict warning row. Appears under the textbox
-	-- when the typed key is already held by another Instance, with
-	-- a Jump button that selects the offending Instance.
-	local statusSlot = makeFrame({
-		parent = parent,
-		color = color("MainBackground"),
-		size = UDim2.new(1, 0, 0, 0),
-		transparency = 1,
-	})
-	statusSlot.BackgroundTransparency = 1
-
-	local function clearStatus()
-		for _, child in ipairs(statusSlot:GetChildren()) do
-			child:Destroy()
-		end
-		statusSlot.Size = UDim2.new(1, 0, 0, 0)
-	end
-
-	local function showConflict(key, conflict)
-		clearStatus()
-		statusSlot.Size = UDim2.new(1, 0, 0, 44)
-
-		local block = makeFrame({
-			parent = statusSlot,
-			color = color("MainBackground"),
-			size = UDim2.fromScale(1, 1),
-		})
-		makePadding(block, 8, 8, 0, 4)
-
-		makeLabel({
-			parent = block,
-			text = string.format('Key "%s" is already used by:', key),
-			color = color("ErrorText"),
-			frameSize = UDim2.new(1, 0, 0, 18),
-		})
-
-		local jump = Instance.new("TextButton")
-		jump.BackgroundColor3 = color("Button")
-		jump.BorderColor3 = color("Border")
-		jump.BorderSizePixel = 1
-		jump.Text = conflict:GetFullName()
-		jump.TextColor3 = color("LinkText")
-		jump.Font = Enum.Font.SourceSans
-		jump.TextSize = 13
-		jump.TextXAlignment = Enum.TextXAlignment.Left
-		jump.TextTruncate = Enum.TextTruncate.AtEnd
-		jump.Size = UDim2.new(1, 0, 0, 20)
-		jump.Position = UDim2.new(0, 0, 0, 20)
-		jump.AutoButtonColor = true
-		jump.Parent = block
-		local pad = Instance.new("UIPadding")
-		pad.PaddingLeft = UDim.new(0, 6)
-		pad.PaddingRight = UDim.new(0, 6)
-		pad.Parent = jump
-
-		jump.MouseButton1Click:Connect(function()
-			Selection:Set({ conflict })
-		end)
-	end
-
-	box.FocusLost:Connect(function()
-		local newKey = box.Text:match("^%s*(.-)%s*$") or ""
-		local oldKey, oldTag = currentAssetKey(instance)
-
-		-- No-op cases.
-		if newKey == (oldKey or "") then
-			clearStatus()
-			box.Text = newKey
-			return
-		end
-
-		-- Empty new value: strip the current tag if any.
-		if newKey == "" then
-			if oldTag then
-				CollectionService:RemoveTag(instance, oldTag)
-			end
-			clearStatus()
-			refresh()
-			return
-		end
-
-		local conflicts = findKeyConflicts(newKey, instance)
-		if #conflicts > 0 then
-			-- Revert the textbox; the conflict block explains why.
-			box.Text = oldKey or ""
-			showConflict(newKey, conflicts[1])
-			return
-		end
-
-		-- Safe to apply. Remove old tag first so the Instance never
-		-- briefly holds two AssetKey tags.
-		if oldTag then
-			CollectionService:RemoveTag(instance, oldTag)
-		end
-		CollectionService:AddTag(instance, KEY_PREFIX .. newKey)
-		clearStatus()
-		refresh()
-	end)
-end
-
-----------------------------------------------------------------------
--- Labels chip section
---
--- Removable chips for each AssetLabel:* tag on the selected
--- Instance, plus an "Add Label" button that opens a picker overlay
--- listing every label known to the place (minus already-attached
--- ones) and a "New label..." option.
-----------------------------------------------------------------------
-
-local pickerOverlay
-
-local function closePicker()
-	if pickerOverlay then
-		pickerOverlay:Destroy()
-		pickerOverlay = nil
-	end
-end
-
--- Picker overlay for "Add Label". Same visual pattern as the
--- ComponentEditor "Add Component" overlay so the install feels
--- consistent. Bottom row is "+ New label…" which swaps the result
--- list for a single textbox input.
-local function openLabelPicker(host, instance)
-	closePicker()
-
-	local attachedSet = {}
-	for _, name in ipairs(currentLabels(instance)) do
-		attachedSet[name] = true
-	end
-
-	pickerOverlay = Instance.new("Frame")
-	pickerOverlay.Size = UDim2.fromScale(1, 1)
-	pickerOverlay.BackgroundColor3 = Color3.new(0, 0, 0)
-	pickerOverlay.BackgroundTransparency = 0.4
-	pickerOverlay.BorderSizePixel = 0
-	pickerOverlay.ZIndex = 10
-	pickerOverlay.Parent = host
-
-	local dim = Instance.new("TextButton")
-	dim.BackgroundTransparency = 1
-	dim.Text = ""
-	dim.Size = UDim2.fromScale(1, 1)
-	dim.ZIndex = 10
-	dim.Parent = pickerOverlay
-	dim.MouseButton1Click:Connect(closePicker)
-
-	local card = makeFrame({
-		parent = pickerOverlay,
-		color = color("MainBackground"),
-		size = UDim2.new(1, -24, 0, 240),
-		position = UDim2.new(0, 12, 1, -252),
-	})
-	card.ZIndex = 11
-	makeStroke(card, color("Border"))
-
+local function buildSectionHeader(parent, label, layoutOrder)
 	local header = makeFrame({
-		parent = card,
-		color = color("CategoryItem"),
-		size = UDim2.new(1, 0, 0, 24),
+		parent = parent,
+		color = HEADER_COLOR,
+		size = UDim2.new(1, 0, 0, 22),
 	})
-	header.ZIndex = 11
+	header.LayoutOrder = layoutOrder
 	makeLabel({
 		parent = header,
-		text = "Add Label",
-		color = color("BrightText"),
-		font = Enum.Font.SourceSansBold,
-		frameSize = UDim2.new(1, -12, 1, 0),
+		text = label,
+		color = color("MainText"),
+		font = Enum.Font.SourceSansSemibold,
+		size = 13,
 		position = UDim2.new(0, 8, 0, 0),
-	}).ZIndex = 11
-
-	local searchHost = makeFrame({
-		parent = card,
-		color = color("InputFieldBackground"),
-		size = UDim2.new(1, -16, 0, 24),
-		position = UDim2.new(0, 8, 0, 30),
+		frameSize = UDim2.new(1, -16, 1, 0),
 	})
-	searchHost.ZIndex = 11
-	makeStroke(searchHost, color("Border"))
-	makePadding(searchHost, 6, 6, 0, 0)
 
-	local searchBox = Instance.new("TextBox")
-	searchBox.BackgroundTransparency = 1
-	searchBox.PlaceholderText = "Search or type new label name…"
-	searchBox.PlaceholderColor3 = color("DimmedText")
-	searchBox.Text = ""
-	searchBox.TextColor3 = color("MainText")
-	searchBox.Font = Enum.Font.SourceSans
-	searchBox.TextSize = 14
-	searchBox.TextXAlignment = Enum.TextXAlignment.Left
-	searchBox.Size = UDim2.fromScale(1, 1)
-	searchBox.ZIndex = 11
-	searchBox.Parent = searchHost
-	searchBox.ClearTextOnFocus = false
+	local bottomLine = Instance.new("Frame")
+	bottomLine.BackgroundColor3 = SEPARATOR_COLOR
+	bottomLine.BorderSizePixel = 0
+	bottomLine.AnchorPoint = Vector2.new(0, 1)
+	bottomLine.Size = UDim2.new(1, 0, 0, 1)
+	bottomLine.Position = UDim2.new(0, 0, 1, 0)
+	bottomLine.Parent = header
+end
 
-	local list = Instance.new("ScrollingFrame")
-	list.Size = UDim2.new(1, -16, 1, -68)
-	list.Position = UDim2.new(0, 8, 0, 60)
-	list.BackgroundTransparency = 1
-	list.BorderSizePixel = 0
-	list.CanvasSize = UDim2.new()
-	list.AutomaticCanvasSize = Enum.AutomaticSize.Y
-	list.ScrollBarThickness = 4
-	list.ZIndex = 11
-	list.Parent = card
+-- One row per tag (key or label) currently on the selected Instance.
+-- Single chip layout: pill background, name on the left, ✕ remove on
+-- the right. Click ✕ → recordChange + RemoveTag.
+local function buildChip(parent, layoutOrder, displayText, onRemove)
+	local row = makeFrame({
+		parent = parent,
+		color = FIELD_COLOR,
+		size = UDim2.new(1, 0, 0, 22),
+	})
+	row.LayoutOrder = layoutOrder
 
-	local listLayout = Instance.new("UIListLayout")
-	listLayout.Padding = UDim.new(0, 2)
-	listLayout.Parent = list
+	makeLabel({
+		parent = row,
+		text = displayText,
+		color = color("MainText"),
+		position = UDim2.new(0, 12, 0, 0),
+		frameSize = UDim2.new(1, -32, 1, 0),
+	})
 
-	local function applyLabel(name)
-		name = name:match("^%s*(.-)%s*$") or ""
-		if name == "" then return end
-		CollectionService:AddTag(instance, LABEL_PREFIX .. name)
-		closePicker()
+	local removeBtn = Instance.new("TextButton")
+	removeBtn.BackgroundTransparency = 1
+	removeBtn.AutoButtonColor = false
+	removeBtn.Text = "×"
+	removeBtn.TextColor3 = color("DimmedText")
+	removeBtn.Font = Enum.Font.SourceSans
+	removeBtn.TextSize = 18
+	removeBtn.AnchorPoint = Vector2.new(1, 0)
+	removeBtn.Size = UDim2.fromOffset(20, 22)
+	removeBtn.Position = UDim2.new(1, 0, 0, 0)
+	removeBtn.Parent = row
+
+	removeBtn.MouseEnter:Connect(function() removeBtn.TextColor3 = color("ErrorText") end)
+	removeBtn.MouseLeave:Connect(function() removeBtn.TextColor3 = color("DimmedText") end)
+
+	removeBtn.MouseButton1Click:Connect(onRemove)
+
+	local bottomLine = Instance.new("Frame")
+	bottomLine.BackgroundColor3 = SEPARATOR_COLOR
+	bottomLine.BorderSizePixel = 0
+	bottomLine.AnchorPoint = Vector2.new(0, 1)
+	bottomLine.Size = UDim2.new(1, 0, 0, 1)
+	bottomLine.Position = UDim2.new(0, 0, 1, 0)
+	bottomLine.Parent = row
+end
+
+----------------------------------------------------------------------
+-- Action buttons
+----------------------------------------------------------------------
+
+-- "+ Set Key" — prepends the Instance.Name as the AssetKey tag. If
+-- another Instance already carries that key, a small inline text box
+-- appears so the user can pick a non-conflicting name without leaving
+-- the panel.
+local function buildSetKeyButton(parent, instance)
+	local btn = Instance.new("TextButton")
+	btn.BackgroundColor3 = ADD_BUTTON_COLOR
+	btn.BorderSizePixel = 0
+	btn.AutoButtonColor = true
+	btn.Text = "+ Set Key"
+	btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	btn.Font = Enum.Font.SourceSansSemibold
+	btn.TextSize = 14
+	btn.AutomaticSize = Enum.AutomaticSize.XY
+	btn.Size = UDim2.new()
+	btn.LayoutOrder = 100
+	btn.Parent = parent
+	roundCorners(btn, 5)
+
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 20)
+	pad.PaddingRight = UDim.new(0, 20)
+	pad.PaddingTop = UDim.new(0, 5)
+	pad.PaddingBottom = UDim.new(0, 5)
+	pad.Parent = btn
+
+	btn.MouseButton1Click:Connect(function()
+		local proposed = instance.Name
+		local taken = allKeysInPlace()
+		if taken[proposed] then
+			warn(string.format(
+				"[Assets] AssetKey '%s' is already in use. Rename the Instance " ..
+				"or remove the existing key first.", proposed))
+			return
+		end
+		recordChange("Set AssetKey " .. proposed, function()
+			CollectionService:AddTag(instance, KEY_PREFIX .. proposed)
+		end)
+		refresh()
+	end)
+end
+
+-- "+ Add Label ▾" — opens a small popup listing every existing
+-- AssetLabel:* in the place plus a "Create new…" entry that swaps to
+-- a text input. Clicking a label adds it to the selected Instance.
+local function buildAddLabelButton(parent, instance)
+	local btn = Instance.new("TextButton")
+	btn.BackgroundColor3 = ADD_BUTTON_COLOR
+	btn.BorderSizePixel = 0
+	btn.AutoButtonColor = true
+	btn.Text = "+ Add Label  ▾"
+	btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	btn.Font = Enum.Font.SourceSansSemibold
+	btn.TextSize = 14
+	btn.AutomaticSize = Enum.AutomaticSize.XY
+	btn.Size = UDim2.new()
+	btn.LayoutOrder = 101
+	btn.Parent = parent
+	roundCorners(btn, 5)
+
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 20)
+	pad.PaddingRight = UDim.new(0, 20)
+	pad.PaddingTop = UDim.new(0, 5)
+	pad.PaddingBottom = UDim.new(0, 5)
+	pad.Parent = btn
+
+	local popup, backdrop
+
+	local function closePopup()
+		if popup then popup:Destroy(); popup = nil end
+		if backdrop then backdrop:Destroy(); backdrop = nil end
+	end
+
+	-- Adds `label` to the selected Instance and closes the popup.
+	-- Idempotent — duplicate tags are silently ignored by Roblox so a
+	-- second click is harmless, but we still record the change so it
+	-- shows in the undo stack.
+	local function applyLabel(label)
+		if label == "" then return end
+		recordChange("Add AssetLabel " .. label, function()
+			CollectionService:AddTag(instance, LABEL_PREFIX .. label)
+		end)
+		closePopup()
 		refresh()
 	end
 
-	local function makePickerRow(text, textColor, onClick)
-		local row = Instance.new("TextButton")
-		row.BackgroundColor3 = color("Button")
-		row.BorderColor3 = color("Border")
-		row.BorderSizePixel = 1
-		row.Text = text
-		row.TextColor3 = textColor or color("ButtonText")
-		row.Font = Enum.Font.SourceSans
-		row.TextSize = 14
-		row.TextXAlignment = Enum.TextXAlignment.Left
-		row.Size = UDim2.new(1, 0, 0, 22)
-		row.AutoButtonColor = true
-		row.ZIndex = 11
-		row.Parent = list
-		local pad = Instance.new("UIPadding")
-		pad.PaddingLeft = UDim.new(0, 8)
-		pad.Parent = row
-		row.MouseButton1Click:Connect(onClick)
-		return row
-	end
+	btn.MouseButton1Click:Connect(function()
+		if popup then closePopup(); return end
 
-	local function renderList()
-		for _, child in ipairs(list:GetChildren()) do
-			if child:IsA("TextButton") or child:IsA("TextLabel") then
-				child:Destroy()
-			end
-		end
+		local btnPos = btn.AbsolutePosition
+		local btnSize = btn.AbsoluteSize
+		local widgetPos = widget.AbsolutePosition
 
-		local query = searchBox.Text:match("^%s*(.-)%s*$") or ""
-		local lowered = query:lower()
+		backdrop = Instance.new("TextButton")
+		backdrop.Size = UDim2.fromScale(1, 1)
+		backdrop.BackgroundTransparency = 1
+		backdrop.Text = ""
+		backdrop.AutoButtonColor = false
+		backdrop.ZIndex = 49
+		backdrop.Parent = widget
+		backdrop.MouseButton1Click:Connect(closePopup)
 
-		-- Filtered existing labels first.
-		local matches = {}
-		for _, name in ipairs(allKnownLabels()) do
-			if not attachedSet[name] then
-				if lowered == "" or name:lower():find(lowered, 1, true) then
-					table.insert(matches, name)
-				end
-			end
-		end
-		for _, name in ipairs(matches) do
-			makePickerRow(name, color("ButtonText"), function()
-				applyLabel(name)
-			end)
-		end
+		popup = Instance.new("Frame")
+		popup.BackgroundColor3 = FIELD_COLOR
+		popup.BorderSizePixel = 0
+		popup.ZIndex = 50
+		popup.Size = UDim2.fromOffset(math.max(160, btnSize.X), 4)
+		popup.AutomaticSize = Enum.AutomaticSize.Y
+		popup.Position = UDim2.new(
+			0, btnPos.X - widgetPos.X,
+			0, btnPos.Y - widgetPos.Y + btnSize.Y + 4)
+		popup.Parent = widget
+		roundCorners(popup, 4)
 
-		-- "Create new" row when the search box has a value that's not
-		-- already an exact-match label. Lets the user mint a brand-new
-		-- label without leaving the picker.
-		if query ~= "" then
-			local exact = false
-			for _, name in ipairs(matches) do
-				if name == query then exact = true; break end
-			end
-			if not exact and not attachedSet[query] then
-				makePickerRow(
-					string.format('+ Create new label "%s"', query),
-					color("LinkText"),
-					function() applyLabel(query) end
-				)
-			end
-		end
+		local stroke = Instance.new("UIStroke")
+		stroke.Color = SEPARATOR_COLOR
+		stroke.Thickness = 1
+		stroke.Parent = popup
 
-		if #matches == 0 and query == "" then
-			local empty = Instance.new("TextLabel")
-			empty.BackgroundTransparency = 1
-			empty.Text = "(no labels in this place yet — type a name to create one)"
-			empty.TextColor3 = color("DimmedText")
-			empty.Font = Enum.Font.SourceSans
-			empty.TextSize = 14
-			empty.TextXAlignment = Enum.TextXAlignment.Left
-			empty.Size = UDim2.new(1, 0, 0, 22)
-			empty.ZIndex = 11
-			empty.Parent = list
-		end
-	end
+		local layout = Instance.new("UIListLayout")
+		layout.SortOrder = Enum.SortOrder.LayoutOrder
+		layout.Parent = popup
 
-	-- Enter key in the search box commits the typed value as a new
-	-- label — quickest path for the common case of "I know exactly
-	-- what I want to call it".
-	searchBox.FocusLost:Connect(function(enterPressed)
-		if enterPressed then
-			applyLabel(searchBox.Text)
-		end
-	end)
-	searchBox:GetPropertyChangedSignal("Text"):Connect(renderList)
-	searchBox:CaptureFocus()
-	renderList()
-end
+		local pad2 = Instance.new("UIPadding")
+		pad2.PaddingTop = UDim.new(0, 4)
+		pad2.PaddingBottom = UDim.new(0, 4)
+		pad2.Parent = popup
 
-local function buildLabelsSection(parent, instance, host)
-	makeSectionHeader(parent, "Labels")
+		local labels = allLabelsInPlace()
+		local order = 0
 
-	local labels = currentLabels(instance)
-
-	-- Chips row. UIListLayout in horizontal mode + auto sizing on the
-	-- container lets chips wrap naturally as the dock is resized.
-	local chipBlock = makeFrame({
-		parent = parent,
-		color = color("MainBackground"),
-		size = UDim2.new(1, 0, 0, 0),
-	})
-	chipBlock.AutomaticSize = Enum.AutomaticSize.Y
-	makePadding(chipBlock, 8, 8, 4, 4)
-
-	local chips = Instance.new("Frame")
-	chips.BackgroundTransparency = 1
-	chips.Size = UDim2.new(1, 0, 0, 0)
-	chips.AutomaticSize = Enum.AutomaticSize.Y
-	chips.Parent = chipBlock
-
-	local chipLayout = Instance.new("UIListLayout")
-	chipLayout.FillDirection = Enum.FillDirection.Horizontal
-	chipLayout.Wraps = true
-	chipLayout.Padding = UDim.new(0, 4)
-	chipLayout.SortOrder = Enum.SortOrder.LayoutOrder
-	chipLayout.Parent = chips
-
-	if #labels == 0 then
-		makeLabel({
-			parent = chips,
-			text = "(no labels)",
-			color = color("DimmedText"),
-			frameSize = UDim2.new(1, 0, 0, 20),
-		})
-	else
-		for i, name in ipairs(labels) do
-			local chip = Instance.new("Frame")
-			chip.BackgroundColor3 = color("Button")
-			chip.BorderColor3 = color("Border")
-			chip.BorderSizePixel = 1
-			chip.AutomaticSize = Enum.AutomaticSize.X
-			chip.Size = UDim2.new(0, 0, 0, 20)
-			chip.LayoutOrder = i
-			chip.Parent = chips
-			makePadding(chip, 8, 4, 0, 0)
-
-			local row = Instance.new("Frame")
+		if #labels == 0 then
+			local row = Instance.new("TextLabel")
 			row.BackgroundTransparency = 1
-			row.AutomaticSize = Enum.AutomaticSize.X
-			row.Size = UDim2.new(0, 0, 1, 0)
-			row.Parent = chip
+			row.Text = "  (no labels yet)"
+			row.TextColor3 = color("DimmedText")
+			row.Font = Enum.Font.SourceSans
+			row.TextSize = 13
+			row.TextXAlignment = Enum.TextXAlignment.Left
+			row.Size = UDim2.new(1, 0, 0, 22)
+			row.ZIndex = 51
+			row.Parent = popup
+			row.LayoutOrder = order; order += 1
+		else
+			for _, label in ipairs(labels) do
+				local rowBtn = Instance.new("TextButton")
+				rowBtn.BackgroundColor3 = FIELD_COLOR
+				rowBtn.BorderSizePixel = 0
+				rowBtn.AutoButtonColor = false
+				rowBtn.Text = "  " .. label
+				rowBtn.TextColor3 = color("MainText")
+				rowBtn.Font = Enum.Font.SourceSans
+				rowBtn.TextSize = 14
+				rowBtn.TextXAlignment = Enum.TextXAlignment.Left
+				rowBtn.Size = UDim2.new(1, 0, 0, 22)
+				rowBtn.ZIndex = 51
+				rowBtn.Parent = popup
+				rowBtn.LayoutOrder = order; order += 1
 
-			local rowLayout = Instance.new("UIListLayout")
-			rowLayout.FillDirection = Enum.FillDirection.Horizontal
-			rowLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-			rowLayout.Padding = UDim.new(0, 4)
-			rowLayout.Parent = row
-
-			local nameLabel = Instance.new("TextLabel")
-			nameLabel.BackgroundTransparency = 1
-			nameLabel.Text = name
-			nameLabel.TextColor3 = color("ButtonText")
-			nameLabel.Font = Enum.Font.SourceSans
-			nameLabel.TextSize = 14
-			nameLabel.AutomaticSize = Enum.AutomaticSize.X
-			nameLabel.Size = UDim2.new(0, 0, 1, 0)
-			nameLabel.Parent = row
-
-			local removeButton = Instance.new("TextButton")
-			removeButton.BackgroundTransparency = 1
-			removeButton.Text = "×"
-			removeButton.TextColor3 = color("DimmedText")
-			removeButton.Font = Enum.Font.SourceSansBold
-			removeButton.TextSize = 16
-			removeButton.Size = UDim2.new(0, 14, 0, 16)
-			removeButton.AutoButtonColor = true
-			removeButton.Parent = row
-
-			removeButton.MouseButton1Click:Connect(function()
-				CollectionService:RemoveTag(instance, LABEL_PREFIX .. name)
-				refresh()
-			end)
+				rowBtn.MouseEnter:Connect(function() rowBtn.BackgroundColor3 = FIELD_HOVER end)
+				rowBtn.MouseLeave:Connect(function() rowBtn.BackgroundColor3 = FIELD_COLOR end)
+				rowBtn.MouseButton1Click:Connect(function() applyLabel(label) end)
+			end
 		end
-	end
 
-	-- Add button row underneath the chips.
-	local addRow = makeFrame({
-		parent = parent,
-		color = color("MainBackground"),
-		size = UDim2.new(1, 0, 0, 28),
-	})
-	makePadding(addRow, 8, 8, 4, 4)
+		local separator = Instance.new("Frame")
+		separator.BackgroundColor3 = SEPARATOR_COLOR
+		separator.BorderSizePixel = 0
+		separator.Size = UDim2.new(1, 0, 0, 1)
+		separator.ZIndex = 51
+		separator.Parent = popup
+		separator.LayoutOrder = order; order += 1
 
-	local addButton = Instance.new("TextButton")
-	addButton.BackgroundColor3 = color("Button")
-	addButton.BorderColor3 = color("Border")
-	addButton.BorderSizePixel = 1
-	addButton.Text = "+ Add Label"
-	addButton.TextColor3 = color("ButtonText")
-	addButton.Font = Enum.Font.SourceSans
-	addButton.TextSize = 14
-	addButton.Size = UDim2.fromScale(1, 1)
-	addButton.AutoButtonColor = true
-	addButton.Parent = addRow
+		-- "Create new…" entry. Replaces the row's label with an inline
+		-- text box on click; FocusLost commits the entered text as the
+		-- new label.
+		local newRow = Instance.new("TextButton")
+		newRow.BackgroundColor3 = FIELD_COLOR
+		newRow.BorderSizePixel = 0
+		newRow.AutoButtonColor = false
+		newRow.Text = "  + New label"
+		newRow.TextColor3 = color("MainText")
+		newRow.Font = Enum.Font.SourceSansSemibold
+		newRow.TextSize = 14
+		newRow.TextXAlignment = Enum.TextXAlignment.Left
+		newRow.Size = UDim2.new(1, 0, 0, 22)
+		newRow.ZIndex = 51
+		newRow.Parent = popup
+		newRow.LayoutOrder = order; order += 1
 
-	addButton.MouseButton1Click:Connect(function()
-		openLabelPicker(host, instance)
+		newRow.MouseEnter:Connect(function() newRow.BackgroundColor3 = FIELD_HOVER end)
+		newRow.MouseLeave:Connect(function() newRow.BackgroundColor3 = FIELD_COLOR end)
+
+		newRow.MouseButton1Click:Connect(function()
+			newRow.Text = ""
+			newRow.Visible = false
+			local input = Instance.new("TextBox")
+			input.BackgroundColor3 = HEADER_COLOR
+			input.BorderSizePixel = 0
+			input.PlaceholderText = "new label"
+			input.PlaceholderColor3 = color("DimmedText")
+			input.Text = ""
+			input.TextColor3 = color("MainText")
+			input.Font = Enum.Font.SourceSans
+			input.TextSize = 14
+			input.TextXAlignment = Enum.TextXAlignment.Left
+			input.Size = UDim2.new(1, -8, 0, 22)
+			input.Position = UDim2.fromOffset(4, 0)
+			input.ZIndex = 52
+			input.ClearTextOnFocus = false
+			input.LayoutOrder = order
+			input.Parent = popup
+			local inputPad = Instance.new("UIPadding")
+			inputPad.PaddingLeft = UDim.new(0, 4)
+			inputPad.Parent = input
+			input:CaptureFocus()
+
+			input.FocusLost:Connect(function(enterPressed)
+				if not enterPressed then closePopup(); return end
+				applyLabel(string.gsub(input.Text, "^%s+", ""):gsub("%s+$", ""))
+			end)
+		end)
 	end)
-end
-
-----------------------------------------------------------------------
--- Project Labels panel
---
--- Read-only live registry of every AssetLabel in the place with its
--- usage count. Helps the user see at a glance what label namespace
--- already exists without having to scroll through tags in the
--- Collection editor.
-----------------------------------------------------------------------
-
-local function buildProjectLabelsSection(parent)
-	makeSectionHeader(parent, "Project labels")
-
-	local labels = allKnownLabels()
-	if #labels == 0 then
-		local row = makeFrame({
-			parent = parent,
-			color = color("MainBackground"),
-			size = UDim2.new(1, 0, 0, 22),
-		})
-		makePadding(row, 12, 8, 0, 0)
-		makeLabel({
-			parent = row,
-			text = "(none defined yet)",
-			color = color("DimmedText"),
-		})
-		return
-	end
-
-	for i, name in ipairs(labels) do
-		local count = #CollectionService:GetTagged(LABEL_PREFIX .. name)
-		local row = makeFrame({
-			parent = parent,
-			color = color("MainBackground"),
-			size = UDim2.new(1, 0, 0, 20),
-		})
-		row.LayoutOrder = i
-		makePadding(row, 12, 8, 0, 0)
-
-		makeLabel({
-			parent = row,
-			text = "• " .. name,
-			color = color("MainText"),
-			frameSize = UDim2.new(1, -60, 1, 0),
-			truncate = Enum.TextTruncate.AtEnd,
-		})
-		makeLabel({
-			parent = row,
-			text = "(" .. count .. ")",
-			color = color("DimmedText"),
-			align = Enum.TextXAlignment.Right,
-			frameSize = UDim2.new(0, 50, 1, 0),
-			position = UDim2.new(1, -54, 0, 0),
-		})
-	end
 end
 
 ----------------------------------------------------------------------
 -- Top-level render
 ----------------------------------------------------------------------
 
-local widget
+local function buildInstanceRow(parent, instance)
+	local row = makeFrame({
+		parent = parent,
+		color = HEADER_COLOR,
+		size = UDim2.new(1, 0, 0, 26),
+	})
+	row.LayoutOrder = 0
+
+	local info = StudioService:GetClassIcon(instance.ClassName)
+	if info and info.Image then
+		local img = Instance.new("ImageLabel")
+		img.BackgroundTransparency = 1
+		img.Image = info.Image
+		if info.ImageRectOffset then img.ImageRectOffset = info.ImageRectOffset end
+		if info.ImageRectSize then img.ImageRectSize = info.ImageRectSize end
+		img.AnchorPoint = Vector2.new(0, 0.5)
+		img.Position = UDim2.new(0, 6, 0.5, 0)
+		img.Size = UDim2.fromOffset(16, 16)
+		img.Parent = row
+	end
+
+	makeLabel({
+		parent = row,
+		text = instance.Name,
+		color = color("MainText"),
+		font = Enum.Font.SourceSansSemibold,
+		size = 14,
+		position = UDim2.new(0, 28, 0, 0),
+		frameSize = UDim2.new(1, -32, 1, 0),
+	})
+
+	local bottomLine = Instance.new("Frame")
+	bottomLine.BackgroundColor3 = SEPARATOR_COLOR
+	bottomLine.BorderSizePixel = 0
+	bottomLine.AnchorPoint = Vector2.new(0, 1)
+	bottomLine.Size = UDim2.new(1, 0, 0, 1)
+	bottomLine.Position = UDim2.new(0, 0, 1, 0)
+	bottomLine.Parent = row
+end
 
 local function build()
-	closePicker()
 	for _, child in ipairs(widget:GetChildren()) do
 		child:Destroy()
 	end
 
 	local root = Instance.new("Frame")
 	root.Size = UDim2.fromScale(1, 1)
-	root.BackgroundColor3 = color("MainBackground")
+	root.BackgroundColor3 = pageColor()
 	root.BorderSizePixel = 0
 	root.Parent = widget
 
@@ -704,59 +510,93 @@ local function build()
 	scroll.Size = UDim2.fromScale(1, 1)
 	scroll.BackgroundTransparency = 1
 	scroll.BorderSizePixel = 0
-	scroll.ScrollBarThickness = 6
+	scroll.ScrollBarThickness = 8
+	scroll.ScrollBarImageColor3 = color("ScrollBar")
 	scroll.CanvasSize = UDim2.new()
 	scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 	scroll.Parent = root
 
 	local layout = Instance.new("UIListLayout")
 	layout.Padding = UDim.new(0, 0)
+	layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
 	layout.Parent = scroll
 
 	local selected = Selection:Get()[1]
-	if selected then
-		-- Selection path header so the user can confirm what they're
-		-- editing without looking back at the Explorer.
-		local pathBlock = makeFrame({
-			parent = scroll,
-			color = color("MainBackground"),
-			size = UDim2.new(1, 0, 0, 24),
-		})
-		makePadding(pathBlock, 8, 8, 4, 0)
+	if not selected then
 		makeLabel({
-			parent = pathBlock,
-			text = "Selected: " .. selected:GetFullName(),
-			color = color("DimmedText"),
-			size = 13,
-			truncate = Enum.TextTruncate.AtEnd,
-		})
-
-		buildAssetKeySection(scroll, selected)
-		buildLabelsSection(scroll, selected, root)
-	else
-		local hint = makeFrame({
 			parent = scroll,
-			color = color("MainBackground"),
-			size = UDim2.new(1, 0, 0, 40),
-		})
-		makePadding(hint, 12, 12, 12, 0)
-		makeLabel({
-			parent = hint,
-			text = "Select an Instance to edit its asset tags.",
+			text = "Select an Instance to tag it as an asset.",
 			color = color("DimmedText"),
+			align = Enum.TextXAlignment.Center,
+			frameSize = UDim2.new(1, 0, 0, 40),
 		})
+		return
 	end
 
-	-- Visual separator before the project-wide registry.
-	local spacer = makeFrame({
-		parent = scroll,
-		color = color("MainBackground"),
-		size = UDim2.new(1, 0, 0, 12),
-		transparency = 1,
-	})
-	spacer.BackgroundTransparency = 1
+	buildInstanceRow(scroll, selected)
 
-	buildProjectLabelsSection(scroll)
+	local currentKey, currentLabels = tagsOnInstance(selected)
+
+	-- KEY section
+	buildSectionHeader(scroll, "KEY", 1)
+	if currentKey then
+		buildChip(scroll, 2, KEY_PREFIX .. currentKey, function()
+			recordChange("Remove AssetKey " .. currentKey, function()
+				CollectionService:RemoveTag(selected, KEY_PREFIX .. currentKey)
+			end)
+			refresh()
+		end)
+	else
+		local hostRow = makeFrame({
+			parent = scroll,
+			color = FIELD_COLOR,
+			transparency = 1,
+			size = UDim2.new(1, 0, 0, 36),
+		})
+		hostRow.BackgroundTransparency = 1
+		hostRow.LayoutOrder = 2
+
+		local centered = Instance.new("Frame")
+		centered.BackgroundTransparency = 1
+		centered.AutomaticSize = Enum.AutomaticSize.XY
+		centered.AnchorPoint = Vector2.new(0.5, 0.5)
+		centered.Position = UDim2.fromScale(0.5, 0.5)
+		centered.Size = UDim2.new()
+		centered.Parent = hostRow
+
+		buildSetKeyButton(centered, selected)
+	end
+
+	-- LABELS section
+	buildSectionHeader(scroll, "LABELS", 50)
+	for i, label in ipairs(currentLabels) do
+		buildChip(scroll, 50 + i, LABEL_PREFIX .. label, function()
+			recordChange("Remove AssetLabel " .. label, function()
+				CollectionService:RemoveTag(selected, LABEL_PREFIX .. label)
+			end)
+			refresh()
+		end)
+	end
+
+	local labelButtonHost = makeFrame({
+		parent = scroll,
+		color = FIELD_COLOR,
+		transparency = 1,
+		size = UDim2.new(1, 0, 0, 36),
+	})
+	labelButtonHost.BackgroundTransparency = 1
+	labelButtonHost.LayoutOrder = 200
+
+	local centered = Instance.new("Frame")
+	centered.BackgroundTransparency = 1
+	centered.AutomaticSize = Enum.AutomaticSize.XY
+	centered.AnchorPoint = Vector2.new(0.5, 0.5)
+	centered.Position = UDim2.fromScale(0.5, 0.5)
+	centered.Size = UDim2.new()
+	centered.Parent = labelButtonHost
+
+	buildAddLabelButton(centered, selected)
 end
 
 ----------------------------------------------------------------------
@@ -764,18 +604,14 @@ end
 ----------------------------------------------------------------------
 
 local toolbar = plugin:CreateToolbar("Assets")
-local toggle = toolbar:CreateButton(
-	"Assets Editor",
-	"Toggle the asset tag inspector",
-	""
-)
+local toggle = toolbar:CreateButton("Assets Editor", "Tag the selected Instance with AssetKey / AssetLabel", "")
 
 local widgetInfo = DockWidgetPluginGuiInfo.new(
 	Enum.InitialDockState.Right,
-	false, -- not initially enabled
-	false, -- don't override saved state
-	320, 440,
-	240, 320
+	false,
+	false,
+	300, 360,
+	220, 240
 )
 widget = plugin:CreateDockWidgetPluginGui("AssetsEditor", widgetInfo)
 widget.Title = "Assets"
@@ -792,34 +628,4 @@ end
 
 widget:GetPropertyChangedSignal("Enabled"):Connect(refresh)
 Selection.SelectionChanged:Connect(refresh)
-
--- CollectionService global tag signals don't fire per-Instance — they
--- fire only when a tag *name* first appears or last disappears
--- anywhere in the place. That's still useful here for keeping the
--- Project Labels panel honest when a brand-new label is minted from
--- outside this plugin or when the last user of a label is untagged.
--- Per-Instance edits we drive ourselves trigger refresh() inline.
-CollectionService.TagAdded:Connect(function(tag)
-	if tag:sub(1, #LABEL_PREFIX) == LABEL_PREFIX
-		or tag:sub(1, #KEY_PREFIX) == KEY_PREFIX then
-		refresh()
-	end
-end)
-CollectionService.TagRemoved:Connect(function(tag)
-	if tag:sub(1, #LABEL_PREFIX) == LABEL_PREFIX
-		or tag:sub(1, #KEY_PREFIX) == KEY_PREFIX then
-		refresh()
-	end
-end)
-
 studio.ThemeChanged:Connect(refresh)
-
--- ESC dismisses the Add Label overlay if it's up.
-UserInputService.InputBegan:Connect(function(input, processed)
-	if processed then return end
-	if input.KeyCode == Enum.KeyCode.Escape and pickerOverlay then
-		closePicker()
-	end
-end)
-
-refresh()
