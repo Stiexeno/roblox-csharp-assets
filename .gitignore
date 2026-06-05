@@ -1,0 +1,7 @@
+# extension.csproj build intermediates (kept for plugin authors)
+extension/bin/
+extension/obj/
+
+# OS junk
+.DS_Store
+Thumbs.db
