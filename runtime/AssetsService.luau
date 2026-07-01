@@ -15,6 +15,28 @@ local CollectionService = game:GetService("CollectionService")
 local KEY_PREFIX = "AssetKey:"
 local LABEL_PREFIX = "AssetLabel:"
 
+-- A clone is a runtime instance, not a registry entry — but Clone() copies
+-- CollectionService tags, so without stripping the AssetKey/AssetLabel tags
+-- the clone is re-discovered by GetTagged and breaks single-key lookups: the
+-- second LoadPrefab of a key would see two tagged Instances and throw. Pooled
+-- views (many clones per key) make this the normal case. Non-asset tags (e.g.
+-- "CollisionBehaviour", used by the view layer) are left intact.
+local function stripAssetTags(root)
+	local function strip(inst)
+		for _, tag in ipairs(CollectionService:GetTags(inst)) do
+			if string.sub(tag, 1, #KEY_PREFIX) == KEY_PREFIX
+				or string.sub(tag, 1, #LABEL_PREFIX) == LABEL_PREFIX then
+				CollectionService:RemoveTag(inst, tag)
+			end
+		end
+	end
+	strip(root)
+	for _, descendant in ipairs(root:GetDescendants()) do
+		strip(descendant)
+	end
+	return root
+end
+
 local AssetsService = setmetatable({}, {
 	__tostring = function() return "AssetsService" end,
 })
@@ -52,7 +74,7 @@ function AssetsService:LoadPrefab(key)
 			"[Assets] Asset '%s' is a ModuleScript. Use Load() instead.",
 			key), 2)
 	end
-	return instance:Clone()
+	return stripAssetTags(instance:Clone())
 end
 
 -- Permissive batch lookup by label. Empty result on no match — the
@@ -74,7 +96,7 @@ function AssetsService:LoadAllPrefabs(label)
 	local result = {}
 	for _, instance in ipairs(tagged) do
 		if not instance:IsA("ModuleScript") then
-			table.insert(result, instance:Clone())
+			table.insert(result, stripAssetTags(instance:Clone()))
 		end
 	end
 	return result
